@@ -1,4 +1,5 @@
 """LangGraph workflow: query analysis -> retrieve -> grade -> (generate | rewrite | fallback)."""
+import json
 import logging
 import os
 import re
@@ -13,7 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from app.ingestion import get_vectorstore
 from app.prompts import (
     GENERATE_PROMPT,
-    GRADE_PROMPT,
+    GRADE_BATCH_PROMPT,
     QUERY_ANALYSIS_PROMPT,
     REWRITE_PROMPT,
 )
@@ -24,6 +25,7 @@ log = logging.getLogger("rag.graph")
 
 TOP_K = 5
 MAX_RETRIES = 2   # rewrites allowed, so at most 3 retrievals in total
+SCORE_CUTOFF = 1.4   # distance above this is treated as clearly unrelated (conservative)
 QUERY_TYPES = {"conceptual", "how-to", "troubleshooting", "api-reference"}
 FALLBACK_ANSWER = (
     "I couldn't find relevant information about that in the indexed documentation."
@@ -35,7 +37,8 @@ def get_llm() -> ChatGroq:
     return ChatGroq(
         model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
         temperature=0,
-        max_retries=3,
+        max_retries=6,
+        reasoning_effort="low",   # fewer hidden reasoning tokens
     )
 
 
@@ -76,26 +79,42 @@ def retrieve(state: GraphState) -> dict:
 
 
 def grade_documents(state: GraphState) -> dict:
-    docs = state["documents"]
-    if not docs:
+    # Cheap pre-filter: skip the LLM for chunks that are clearly far from the query
+    candidates = [d for d in state["documents"] if d.metadata["score"] <= SCORE_CUTOFF]
+    log.info("[grade] %d of %d chunks passed the score pre-filter",
+             len(candidates), len(state["documents"]))
+    if not candidates:
         return {"relevant_documents": []}
 
-    # Grade against the ORIGINAL question, one LLM call per chunk
-    inputs = [{"question": state["question"], "document": d.page_content} for d in docs]
-    verdicts = _chain(GRADE_PROMPT).batch(inputs, config={"max_concurrency": 4})
+    # ONE LLM call grades all remaining chunks
+    excerpts = "\n\n".join(
+        f"Excerpt {i} ({d.metadata['doc_name']} > {d.metadata['section']}):\n{d.page_content[:700]}"
+        for i, d in enumerate(candidates, start=1)
+    )
+    verdicts = None
+    for _ in range(2):   # one retry if the reply isn't valid JSON
+        raw = _chain(GRADE_BATCH_PROMPT).invoke(
+            {"n": len(candidates), "question": state["question"], "excerpts": excerpts}
+        )
+        match = re.search(r"\[.*?\]", raw, re.DOTALL)
+        try:
+            parsed = json.loads(match.group(0)) if match else None
+            if isinstance(parsed, list) and len(parsed) == len(candidates):
+                verdicts = [bool(v) for v in parsed]
+                break
+        except json.JSONDecodeError:
+            pass
+    if verdicts is None:
+        log.warning("[grade] could not parse grader output; treating all as irrelevant")
+        verdicts = [False] * len(candidates)
 
     relevant = []
-    for doc, verdict in zip(docs, verdicts):
-        keep = verdict.strip().lower().startswith("yes")
-        log.info(
-            "[grade] %s | %s | %s",
-            "KEEP" if keep else "DROP",
-            doc.metadata["doc_name"],
-            doc.metadata["section"],
-        )
+    for doc, keep in zip(candidates, verdicts):
+        log.info("[grade] %s | %s | %s", "KEEP" if keep else "DROP",
+                 doc.metadata["doc_name"], doc.metadata["section"])
         if keep:
             relevant.append(doc)
-    log.info("[grade] %d of %d relevant", len(relevant), len(docs))
+    log.info("[grade] %d of %d relevant", len(relevant), len(state["documents"]))
     return {"relevant_documents": relevant}
 
 

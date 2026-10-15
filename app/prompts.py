@@ -11,18 +11,15 @@ QUERY: <query>
 
 Question: {question}"""
 
-GRADE_PROMPT = """You are grading whether a documentation excerpt helps answer a question.
+GRADE_BATCH_PROMPT = """You are grading documentation excerpts for relevance to a question.
+For each excerpt, decide whether it contains information that helps answer the question, even partially.
+Mark false if it is unrelated, or only shares keywords without being useful.
 
-Answer "yes" if the excerpt contains information that helps answer the question, even partially.
-Answer "no" if it is unrelated, or only shares a few keywords without being useful.
-
-Reply with one word: yes or no.
+Reply with ONLY a JSON array of {n} booleans, in the same order as the excerpts. Example: [true, false, true]
 
 Question: {question}
 
-Excerpt:
-{document}"""
-
+{excerpts}"""
 REWRITE_PROMPT = """A search over FastAPI documentation did not return useful results.
 Write ONE new search query for the original question that approaches it from a different angle:
 use different terminology, more specific technical terms, or a broader concept.
@@ -39,8 +36,9 @@ GENERATE_PROMPT = """You are a technical documentation assistant. Answer the que
 
 Rules:
 - If the sources do not contain the answer, say so. Do not use outside knowledge.
-- Cite the sources you used with their numbers in square brackets, like [1] or [2][3].
-- Be clear and concise. Include a short code example when the sources contain one that helps.
+- Cite sources ONLY by number, like [1] or [2][3]. Never write section names in brackets.
+- Code examples must be copied or adapted from the sources. Do not invent fields, functions or parameters that the sources don't contain.
+- Be clear and concise.
 
 Question: {question}
 
