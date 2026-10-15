@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import RedirectResponse
 from groq import APIStatusError, RateLimitError
 from markdownify import markdownify as md
 
@@ -50,6 +51,11 @@ def _html_to_markdown(html: str) -> str:
     for tag in node.select("script, style, nav, button, a.headerlink"):
         tag.decompose()
     return md(str(node), heading_style="ATX")
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health")
