@@ -24,6 +24,9 @@ class QueryResponse(BaseModel):
     query_type: str
     retries: int
     queries_tried: list[str]
+    grounding: Literal["supported", "unsupported", "unverified", "not_applicable"]
+    grounding_note: str
+    generation_attempts: int
 
 
 class IngestUrlRequest(BaseModel):

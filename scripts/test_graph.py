@@ -11,16 +11,19 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 from app.graph import graph, run_query
 
 QUESTIONS = [
-    "How do I accept JSON data in a POST request?",   # should answer on the first try
-    "How do I return a 404 error?",                   # troubleshooting-style
-    "Best pasta recipe?",                             # off-topic: should retry, then fall back
+    "How do I accept JSON data in a POST request?",
+    "How do I return a 404 error?",
+    "How do I limit a query parameter to a maximum length of 50 characters?",  # likely beyond the docs
+    "Best pasta recipe?",
 ]
 
 for q in QUESTIONS:
     print("\n" + "=" * 70)
     print("Q:", q)
     result = run_query(q)
-    print("\nSTATUS:", result["status"], "| retries:", result["retries"])
+    print("\nSTATUS:", result["status"], "| retries:", result["retries"],
+          "| generations:", result["generation_attempts"])
+    print("GROUNDING:", result["grounding"], "|", result["grounding_note"])
     print("ANSWER:", result["answer"])
     print("SOURCES:", json.dumps(result["sources"], indent=2))
 

@@ -20,6 +20,7 @@ Reply with ONLY a JSON array of {n} booleans, in the same order as the excerpts.
 Question: {question}
 
 {excerpts}"""
+
 REWRITE_PROMPT = """A search over FastAPI documentation did not return useful results.
 Write ONE new search query for the original question that approaches it from a different angle:
 use different terminology, more specific technical terms, or a broader concept.
@@ -39,8 +40,24 @@ Rules:
 - Cite sources ONLY by number, like [1] or [2][3]. Never write section names in brackets.
 - Code examples must be copied or adapted from the sources. Do not invent fields, functions or parameters that the sources don't contain.
 - Be clear and concise.
-
+{feedback}
 Question: {question}
 
 Sources:
 {context}"""
+
+GROUNDING_PROMPT = """You are a strict fact checker. Decide whether an ANSWER is fully supported by the SOURCES.
+
+Check the factual claims, and any functions, parameters, fields or behaviours used in code.
+Ignore: wording, formatting, citation markers like [1], and obvious placeholder names in code
+(for example a made-up helper like get_item_from_db that is clearly a stand-in).
+Flag anything that states or relies on a fact that is NOT in the sources.
+
+Reply with ONLY a JSON object, no other text:
+{{"supported": true or false, "unsupported_claims": ["short description", ...]}}
+
+SOURCES:
+{sources}
+
+ANSWER:
+{answer}"""

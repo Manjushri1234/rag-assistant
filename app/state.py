@@ -12,7 +12,10 @@ class GraphState(TypedDict):
     query_history: Annotated[list[str], operator.add]   # every query tried (reducer: append)
     documents: list[Document]        # chunks returned by retrieval
     relevant_documents: list[Document]   # chunks that passed grading
-    retry_count: int                 # how many rewrites so far
-    generation: str                  # the final answer text
+    retry_count: int                 # how many query rewrites so far
+    generation: str                  # the answer text
+    generation_attempts: int         # how many times generate has run
+    grounding: str                   # supported | unsupported | unverified | not_applicable
+    grounding_note: str              # which claims were unsupported (if any)
     sources: list[dict]              # citations returned to the user
     status: str                      # "answered" or "no_answer"

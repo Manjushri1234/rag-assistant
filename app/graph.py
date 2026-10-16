@@ -1,4 +1,5 @@
-"""LangGraph workflow: query analysis -> retrieve -> grade -> (generate | rewrite | fallback)."""
+"""LangGraph workflow:
+query analysis -> retrieve -> grade -> (generate -> check_grounding | rewrite | fallback)."""
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from app.ingestion import get_vectorstore
 from app.prompts import (
     GENERATE_PROMPT,
     GRADE_BATCH_PROMPT,
+    GROUNDING_PROMPT,
     QUERY_ANALYSIS_PROMPT,
     REWRITE_PROMPT,
 )
@@ -24,8 +26,9 @@ load_dotenv(override=True)
 log = logging.getLogger("rag.graph")
 
 TOP_K = 5
-MAX_RETRIES = 2   # rewrites allowed, so at most 3 retrievals in total
-SCORE_CUTOFF = 1.4   # distance above this is treated as clearly unrelated (conservative)
+MAX_RETRIES = 2          # query rewrites allowed, so at most 3 retrievals
+MAX_REGENERATIONS = 1    # extra generate attempts if the answer is not grounded
+SCORE_CUTOFF = 1.4       # distance above this is treated as clearly unrelated
 QUERY_TYPES = {"conceptual", "how-to", "troubleshooting", "api-reference"}
 FALLBACK_ANSWER = (
     "I couldn't find relevant information about that in the indexed documentation."
@@ -38,7 +41,7 @@ def get_llm() -> ChatGroq:
         model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
         temperature=0,
         max_retries=6,
-        reasoning_effort="low",   # fewer hidden reasoning tokens
+        reasoning_effort="low",
     )
 
 
@@ -55,7 +58,6 @@ def query_analysis(state: GraphState) -> dict:
     query_type = type_match.group(1).strip().lower() if type_match else "unknown"
     if query_type not in QUERY_TYPES:
         query_type = "unknown"
-    # If the LLM reply is malformed, fall back to the raw question
     search_query = query_match.group(1).strip() if query_match else state["question"]
 
     log.info("[query_analysis] type=%s | query=%s", query_type, search_query)
@@ -79,20 +81,18 @@ def retrieve(state: GraphState) -> dict:
 
 
 def grade_documents(state: GraphState) -> dict:
-    # Cheap pre-filter: skip the LLM for chunks that are clearly far from the query
     candidates = [d for d in state["documents"] if d.metadata["score"] <= SCORE_CUTOFF]
     log.info("[grade] %d of %d chunks passed the score pre-filter",
              len(candidates), len(state["documents"]))
     if not candidates:
         return {"relevant_documents": []}
 
-    # ONE LLM call grades all remaining chunks
     excerpts = "\n\n".join(
         f"Excerpt {i} ({d.metadata['doc_name']} > {d.metadata['section']}):\n{d.page_content[:700]}"
         for i, d in enumerate(candidates, start=1)
     )
     verdicts = None
-    for _ in range(2):   # one retry if the reply isn't valid JSON
+    for _ in range(2):
         raw = _chain(GRADE_BATCH_PROMPT).invoke(
             {"n": len(candidates), "question": state["question"], "excerpts": excerpts}
         )
@@ -140,11 +140,17 @@ def generate(state: GraphState) -> dict:
         f"Source {i} ({d.metadata['doc_name']} > {d.metadata['section']}):\n{d.page_content}"
         for i, d in enumerate(docs, start=1)
     )
+    # On a regeneration, tell the model what the checker found wrong
+    feedback = ""
+    if state["grounding"] == "unsupported" and state["grounding_note"]:
+        feedback = (
+            "\nIMPORTANT: your previous answer contained claims not found in the sources:\n"
+            f"{state['grounding_note']}\nRemove or correct them. Use only what the sources say.\n"
+        )
     answer = _chain(GENERATE_PROMPT).invoke(
-        {"question": state["question"], "context": context}
+        {"question": state["question"], "context": context, "feedback": feedback}
     )
 
-    # Return only the sources the answer actually cites (all of them if none are cited)
     cited = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
     used = [i for i in range(1, len(docs) + 1) if i in cited] or list(range(1, len(docs) + 1))
     sources = [
@@ -157,22 +163,67 @@ def generate(state: GraphState) -> dict:
         }
         for i in used
     ]
-    log.info("[generate] answered using %d sources", len(sources))
-    return {"generation": answer.strip(), "sources": sources, "status": "answered"}
+    attempt = state["generation_attempts"] + 1
+    log.info("[generate] attempt %d | used %d sources", attempt, len(sources))
+    return {
+        "generation": answer.strip(),
+        "sources": sources,
+        "status": "answered",
+        "generation_attempts": attempt,
+    }
+
+
+def check_grounding(state: GraphState) -> dict:
+    """Self-RAG style check: is the answer supported by the retrieved sources?"""
+    sources_text = "\n\n".join(
+        f"Source {i}:\n{d.page_content}"
+        for i, d in enumerate(state["relevant_documents"], start=1)
+    )
+    raw = _chain(GROUNDING_PROMPT).invoke(
+        {"sources": sources_text, "answer": state["generation"]}
+    )
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    try:
+        parsed = json.loads(match.group(0)) if match else {}
+        supported = bool(parsed["supported"])
+        claims = [str(c) for c in parsed.get("unsupported_claims", [])]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # Checker output unusable: do not block the answer, but say it was not verified
+        log.warning("[grounding] could not parse checker output")
+        return {"grounding": "unverified", "grounding_note": ""}
+
+    if supported:
+        log.info("[grounding] SUPPORTED")
+        return {"grounding": "supported", "grounding_note": ""}
+
+    note = "; ".join(claims) or "Some statements are not supported by the sources."
+    log.info("[grounding] UNSUPPORTED | %s", note)
+    return {"grounding": "unsupported", "grounding_note": note}
 
 
 def fallback(state: GraphState) -> dict:
     log.info("[fallback] no relevant documents after %d retries", state["retry_count"])
-    return {"generation": FALLBACK_ANSWER, "sources": [], "status": "no_answer"}
+    return {
+        "generation": FALLBACK_ANSWER,
+        "sources": [],
+        "status": "no_answer",
+        "grounding": "not_applicable",
+    }
 
 
-# ---------------- Conditional edge ----------------
+# ---------------- Conditional edges ----------------
 def route_after_grading(state: GraphState) -> str:
     if state["relevant_documents"]:
         return "generate"
     if state["retry_count"] < MAX_RETRIES:
         return "rewrite_query"
     return "fallback"
+
+
+def route_after_grounding(state: GraphState) -> str:
+    if state["grounding"] == "unsupported" and state["generation_attempts"] <= MAX_REGENERATIONS:
+        return "generate"
+    return "end"
 
 
 # ---------------- Build ----------------
@@ -183,6 +234,7 @@ def build_graph():
     g.add_node("grade_documents", grade_documents)
     g.add_node("rewrite_query", rewrite_query)
     g.add_node("generate", generate)
+    g.add_node("check_grounding", check_grounding)
     g.add_node("fallback", fallback)
 
     g.add_edge(START, "query_analysis")
@@ -193,8 +245,13 @@ def build_graph():
         route_after_grading,
         {"generate": "generate", "rewrite_query": "rewrite_query", "fallback": "fallback"},
     )
-    g.add_edge("rewrite_query", "retrieve")   # the retry loop
-    g.add_edge("generate", END)
+    g.add_edge("rewrite_query", "retrieve")        # retry loop
+    g.add_edge("generate", "check_grounding")
+    g.add_conditional_edges(
+        "check_grounding",
+        route_after_grounding,
+        {"generate": "generate", "end": END},      # regeneration loop
+    )
     g.add_edge("fallback", END)
     return g.compile()
 
@@ -203,7 +260,7 @@ graph = build_graph()
 
 
 def run_query(question: str) -> dict:
-    """Run the workflow once. This is what the FastAPI endpoint will call."""
+    """Run the workflow once. This is what the FastAPI endpoint calls."""
     result = graph.invoke(
         {
             "question": question,
@@ -214,6 +271,9 @@ def run_query(question: str) -> dict:
             "relevant_documents": [],
             "retry_count": 0,
             "generation": "",
+            "generation_attempts": 0,
+            "grounding": "",
+            "grounding_note": "",
             "sources": [],
             "status": "",
         }
@@ -225,4 +285,7 @@ def run_query(question: str) -> dict:
         "query_type": result["query_type"],
         "retries": result["retry_count"],
         "queries_tried": result["query_history"],
+        "grounding": result["grounding"],
+        "grounding_note": result["grounding_note"],
+        "generation_attempts": result["generation_attempts"],
     }
