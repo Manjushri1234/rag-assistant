@@ -49,6 +49,14 @@ def _chain(template: str):
     return ChatPromptTemplate.from_template(template) | get_llm() | StrOutputParser()
 
 
+def _clean_query(text: str, fallback: str) -> str:
+    """Remove stray model markup such as [/commentary] or <think> tags from a query."""
+    text = re.sub(r"\[/?\w+\]", "", text)      # [/commentary], [analysis] ...
+    text = re.sub(r"</?\w+>", "", text)        # <think>, </think> ...
+    text = text.strip().strip('"').strip()
+    return text or fallback
+
+
 # ---------------- Nodes ----------------
 def query_analysis(state: GraphState) -> dict:
     raw = _chain(QUERY_ANALYSIS_PROMPT).invoke({"question": state["question"]})
@@ -58,7 +66,9 @@ def query_analysis(state: GraphState) -> dict:
     query_type = type_match.group(1).strip().lower() if type_match else "unknown"
     if query_type not in QUERY_TYPES:
         query_type = "unknown"
-    search_query = query_match.group(1).strip() if query_match else state["question"]
+    search_query = _clean_query(
+        query_match.group(1) if query_match else "", state["question"]
+    )
 
     log.info("[query_analysis] type=%s | query=%s", query_type, search_query)
     return {
@@ -123,8 +133,8 @@ def rewrite_query(state: GraphState) -> dict:
     raw = _chain(REWRITE_PROMPT).invoke(
         {"question": state["question"], "previous_queries": previous}
     )
-    lines = [ln.strip().strip('"') for ln in raw.splitlines() if ln.strip()]
-    new_query = lines[0] if lines else state["question"]
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    new_query = _clean_query(lines[0] if lines else "", state["question"])
 
     log.info("[rewrite] retry %d | new query: %s", state["retry_count"] + 1, new_query)
     return {
